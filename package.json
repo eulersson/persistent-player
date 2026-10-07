@@ -1,6 +1,6 @@
 {
   "name": "obsidian-persistent-player",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Keep audio playing when its embed scrolls out of view.",
   "private": true,
   "main": "main.js",

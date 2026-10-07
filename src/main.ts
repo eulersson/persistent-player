@@ -1,4 +1,4 @@
-import { App, MarkdownView, Plugin, setIcon } from "obsidian";
+import { App, MarkdownView, Platform, Plugin, setIcon } from "obsidian";
 
 // -- Types -------------------------------------------------------------------
 
@@ -145,8 +145,8 @@ class NowPlayingBar {
 		ctrl.on("timeupdate", () => this.syncProgress());
 		ctrl.on("ratechange", () => { if (this.rateEl) this.rateEl.textContent = `${this.ctrl.playbackRate}x`; });
 
-		plugin.registerDomEvent(document, "mousemove", (e) => { if (this.dragging) this.seekTo(e.clientX); });
-		plugin.registerDomEvent(document, "mouseup", () => { this.dragging = false; });
+		// Rotation or a resized window can move the notch and the view header.
+		plugin.registerDomEvent(window, "resize", () => this.clearTopObstructions());
 	}
 
 	show() {
@@ -168,7 +168,17 @@ class NowPlayingBar {
 		this.track = center.createDiv("pp-np-track");
 		this.fill = this.track.createDiv("pp-np-fill");
 		this.syncProgress();
-		center.addEventListener("mousedown", (e) => { this.dragging = true; this.seekTo(e.clientX); });
+		// Pointer events cover mouse, touch and pen; capture keeps the drag
+		// going when the finger or cursor leaves the track.
+		center.addEventListener("pointerdown", (e) => {
+			this.dragging = true;
+			center.setPointerCapture(e.pointerId);
+			this.seekTo(e.clientX);
+		});
+		center.addEventListener("pointermove", (e) => { if (this.dragging) this.seekTo(e.clientX); });
+		const endDrag = () => { this.dragging = false; };
+		center.addEventListener("pointerup", endDrag);
+		center.addEventListener("pointercancel", endDrag);
 
 		const right = bar.createDiv("pp-np-right");
 		this.timeEl = right.createSpan({ cls: "pp-np-time" });
@@ -189,6 +199,30 @@ class NowPlayingBar {
 
 		const vc = view.containerEl.querySelector(".view-content");
 		if (vc) vc.insertBefore(bar, vc.firstChild);
+		window.requestAnimationFrame(() => this.clearTopObstructions());
+	}
+
+	/**
+	 * On phones the top of the view can sit under the notch / status bar or
+	 * under a floating view header, where the bar can't be tapped. Pad it down
+	 * until it clears both.
+	 */
+	private clearTopObstructions() {
+		const bar = this.bar;
+		if (!bar || !Platform.isMobile) return;
+
+		bar.setCssProps({ "--pp-top-offset": "0px" });
+		const top = bar.getBoundingClientRect().top;
+		let minTop = safeAreaTop();
+
+		const header = bar.closest(".workspace-leaf-content")?.querySelector(".view-header");
+		if (header) {
+			const r = header.getBoundingClientRect();
+			// Only an overlapping header matters; one laid out above the bar is fine.
+			if (r.height > 0 && r.top <= top + 1 && r.bottom > top) minTop = Math.max(minTop, r.bottom);
+		}
+
+		bar.setCssProps({ "--pp-top-offset": `${Math.max(0, minTop - top)}px` });
 	}
 
 	hide() { this.bar?.remove(); this.bar = null; }
@@ -322,6 +356,14 @@ export default class PersistentPlayerPlugin extends Plugin {
 		this.ctrl?.destroy();
 		this.bar?.destroy();
 	}
+}
+
+/** Height of the area hidden by the notch / status bar, in CSS pixels. */
+function safeAreaTop(): number {
+	const probe = document.body.createDiv("pp-safe-area-probe");
+	const h = probe.getBoundingClientRect().height;
+	probe.remove();
+	return h;
 }
 
 function fmt(sec: number): string {
