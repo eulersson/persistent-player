@@ -1,4 +1,4 @@
-import { App, MarkdownView, Platform, Plugin, setIcon } from "obsidian";
+import { App, FileView, ItemView, MarkdownView, Platform, Plugin, setIcon, WorkspaceLeaf } from "obsidian";
 
 // -- Types -------------------------------------------------------------------
 
@@ -6,12 +6,15 @@ type Evt = "play" | "pause" | "timeupdate" | "ratechange";
 type Cb = () => void;
 
 // -- Controller --------------------------------------------------------------
-// Maintains a pool of <audio> elements, one per note. Switching notes pauses
-// one element and adopts another, so loaded state and position are preserved.
+// Maintains a pool of <audio> elements, one per note, so each note keeps its
+// loaded audio and position. Only the active one plays, and it keeps playing
+// while you move to other pages.
 
 class Controller {
 	/** notePath -> audio element (keeps loaded state, position, etc.). */
 	private pool = new Map<string, HTMLAudioElement>();
+	/** src -> position it was left at, for a note with several audio embeds. */
+	private positions = new Map<string, number>();
 	private activeNote = "";
 	private volume = 1;
 	private rate = 1;
@@ -35,8 +38,12 @@ class Controller {
 
 	duration(): number { return this.active?.duration ?? 0; }
 
-	/** Start playing a new src in a note. Creates or reuses an audio element. */
-	loadAndPlay(src: string, note: string) {
+	/**
+	 * Start playing a src in a note. Creates or reuses an audio element.
+	 * `from` is where the embed's scrubber sits: it mirrors the playback
+	 * position, so it only differs when the user dragged it.
+	 */
+	loadAndPlay(src: string, note: string, from = 0) {
 		this.active?.pause();
 
 		let el = this.pool.get(note);
@@ -46,26 +53,28 @@ class Controller {
 			this.wireEvents(el);
 		}
 
-		if (el.src !== src) el.src = src;
+		if (el.src !== src) {
+			// Switching to another audio in the same note: remember where the
+			// outgoing one was, and resume the incoming one where it was left.
+			if (el.src) this.positions.set(el.src, el.currentTime);
+			el.src = src;
+			const audio = el;
+			const resumeAt = from || this.positions.get(src);
+			if (resumeAt) audio.addEventListener("loadedmetadata", () => { audio.currentTime = resumeAt; }, { once: true });
+		} else if (Math.abs(from - el.currentTime) > 1) {
+			el.currentTime = from;
+		}
 		el.volume = this.volume;
 		el.playbackRate = this.rate;
 		this.activeNote = note;
 		void el.play();
 	}
 
-	/** Switch to a note: pause the outgoing note and adopt the new one. */
-	switchTo(note: string): boolean {
-		if (note === this.activeNote) return this.active !== null;
-
-		this.active?.pause();
-		this.activeNote = note;
-
-		const el = this.active;
-		if (!el || !el.src) return false;
-
-		// Don't auto-play. Keep the bar visible so the user can resume.
-		this.emit("pause");
-		return true;
+	/** Where src was left in a note: live if it's loaded there, else remembered. */
+	positionOf(src: string, note: string): number {
+		const el = this.pool.get(note);
+		if (el && el.src === src) return el.currentTime;
+		return this.positions.get(src) ?? 0;
 	}
 
 	play() { void this.active?.play(); }
@@ -96,6 +105,15 @@ class Controller {
 		const el = this.pool.get(note);
 		if (el) { el.pause(); el.remove(); this.pool.delete(note); }
 		if (this.activeNote === note) this.activeNote = "";
+	}
+
+	/** Follow a note that was renamed or moved. */
+	renameNote(oldPath: string, newPath: string) {
+		const el = this.pool.get(oldPath);
+		if (!el) return;
+		this.pool.delete(oldPath);
+		this.pool.set(newPath, el);
+		if (this.activeNote === oldPath) this.activeNote = newPath;
 	}
 
 	private wireEvents(el: HTMLAudioElement) {
@@ -137,7 +155,9 @@ class NowPlayingBar {
 	private fill: HTMLElement | null = null;
 	private timeEl: HTMLElement | null = null;
 	private rateEl: HTMLElement | null = null;
+	private sourceEl: HTMLElement | null = null;
 	private dragging = false;
+	private measureQueued = false;
 
 	constructor(private ctrl: Controller, private app: App, plugin: Plugin) {
 		ctrl.on("play", () => { this.show(); this.syncIcon(); });
@@ -145,15 +165,36 @@ class NowPlayingBar {
 		ctrl.on("timeupdate", () => this.syncProgress());
 		ctrl.on("ratechange", () => { if (this.rateEl) this.rateEl.textContent = `${this.ctrl.playbackRate}x`; });
 
-		// Rotation or a resized window can move the notch and the view header.
-		plugin.registerDomEvent(window, "resize", () => this.clearTopObstructions());
+		// The audio keeps playing from page to page, so the bar follows along.
+		plugin.registerEvent(app.workspace.on("active-leaf-change", () => this.attach()));
+		plugin.registerEvent(app.workspace.on("layout-change", () => this.attach()));
+
+		// Resizing the window, a split or a sidebar can move the bar under the status bar.
+		plugin.registerEvent(app.workspace.on("resize", () => this.requestMeasure()));
+
+		// Toggling a theme's focus mode or full screen flips body classes and can
+		// show or hide the status bar. Obsidian's addClass/removeClass rewrite the
+		// attribute even when nothing changes, so only react to a real change.
+		let classes = document.body.className;
+		const observer = new MutationObserver(() => {
+			if (document.body.className === classes) return;
+			classes = document.body.className;
+			this.requestMeasure();
+		});
+		observer.observe(document.body, { attributes: true, attributeFilter: ["class"] });
+		plugin.register(() => observer.disconnect());
+		// A status bar fading in or out has only settled once its transition ends.
+		plugin.registerDomEvent(document, "transitionend", (e) => {
+			if (e.target instanceof HTMLElement && e.target.hasClass("status-bar")) this.requestMeasure();
+		});
 	}
 
 	show() {
-		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (!view) return;
+		if (!this.bar) this.build();
+		this.attach();
+	}
 
-		this.bar?.remove();
+	private build() {
 		const bar = (this.bar = createDiv("pp-now-playing"));
 
 		this.mkSkip(bar, "-5s", "Skip back 5 seconds", -5);
@@ -163,6 +204,12 @@ class NowPlayingBar {
 		play.setAttribute("title", "Play or pause");
 		play.addEventListener("click", () => this.ctrl.toggle());
 		this.mkSkip(bar, "+5s", "Skip forward 5 seconds", 5);
+
+		this.sourceEl = bar.createDiv("pp-np-source");
+		this.sourceEl.addEventListener("click", () => {
+			const file = this.app.vault.getFileByPath(this.ctrl.notePath);
+			if (file) void this.app.workspace.getLeaf(false).openFile(file);
+		});
 
 		const center = bar.createDiv("pp-np-center");
 		this.track = center.createDiv("pp-np-track");
@@ -196,36 +243,89 @@ class NowPlayingBar {
 			this.ctrl.clearNote(this.ctrl.notePath);
 			this.hide();
 		});
+	}
 
-		const vc = view.containerEl.querySelector(".view-content");
-		if (vc) vc.insertBefore(bar, vc.firstChild);
-		window.requestAnimationFrame(() => this.clearTopObstructions());
+	/** Move the bar to the bottom of the main-area page you're on, whatever kind of page it is. */
+	attach() {
+		const bar = this.bar;
+		const leaf = this.app.workspace.getMostRecentLeaf();
+		if (!bar || !leaf || !(leaf.view instanceof ItemView)) return;
+
+		// After .view-content, not inside it: the editor fills .view-content,
+		// which clips anything below. The leaf is a flex column, so the content
+		// shrinks to make room for the bar.
+		const vc = leaf.view.contentEl;
+		if (bar.previousElementSibling !== vc) vc.after(bar);
+		this.syncSource(leaf);
+		this.requestMeasure();
+	}
+
+	/** Away from the audio's note, name it in the bar; clicking the name goes back. */
+	private syncSource(leaf: WorkspaceLeaf) {
+		const el = this.sourceEl;
+		if (!el) return;
+		const file = this.app.vault.getFileByPath(this.ctrl.notePath);
+		const here = leaf.view instanceof FileView && leaf.view.file === file;
+		el.toggle(!!file && !here);
+		if (!file) return;
+		el.setText(file.basename);
+		el.setAttribute("aria-label", `Go to ${file.basename}`);
+		el.setAttribute("title", `Go to ${file.basename}`);
 	}
 
 	/**
-	 * On phones the top of the view can sit under the notch / status bar or
-	 * under a floating view header, where the bar can't be tapped. Pad it down
-	 * until it clears both.
+	 * Measure on the next frame, at most once per frame. Measuring writes to
+	 * the DOM, so this keeps any feedback through the observers from spinning.
 	 */
-	private clearTopObstructions() {
-		const bar = this.bar;
-		if (!bar || !Platform.isMobile) return;
-
-		bar.setCssProps({ "--pp-top-offset": "0px" });
-		const top = bar.getBoundingClientRect().top;
-		let minTop = safeAreaTop();
-
-		const header = bar.closest(".workspace-leaf-content")?.querySelector(".view-header");
-		if (header) {
-			const r = header.getBoundingClientRect();
-			// Only an overlapping header matters; one laid out above the bar is fine.
-			if (r.height > 0 && r.top <= top + 1 && r.bottom > top) minTop = Math.max(minTop, r.bottom);
-		}
-
-		bar.setCssProps({ "--pp-top-offset": `${Math.max(0, minTop - top)}px` });
+	private requestMeasure() {
+		if (this.measureQueued) return;
+		this.measureQueued = true;
+		window.requestAnimationFrame(() => {
+			this.measureQueued = false;
+			this.clearBottomObstructions();
+		});
 	}
 
-	hide() { this.bar?.remove(); this.bar = null; }
+	/**
+	 * On desktop the status bar floats over the bottom corner of the workspace
+	 * and can cover the bar's controls. Pad the bar up until they clear it.
+	 * Phones reserve room for the floating navbar in CSS instead.
+	 */
+	private clearBottomObstructions() {
+		const bar = this.bar;
+		if (!bar || Platform.isMobile) return;
+
+		bar.setCssProps({ "--pp-bottom-offset": "0px" });
+		const r = bar.getBoundingClientRect();
+		let offset = 0;
+		let hiddenOnTop = false;
+
+		const status = document.body.querySelector(".status-bar");
+		if (status) {
+			const s = status.getBoundingClientRect();
+			// Only an overlapping status bar matters; one over another pane is fine.
+			if (s.height > 0 && s.left < r.right && s.right > r.left && s.top < r.bottom) {
+				// A theme can fade it out yet leave it on top (Minimal's focus
+				// mode): then skip the padding and let clicks through to the bar.
+				if (getComputedStyle(status).opacity === "0") hiddenOnTop = true;
+				else offset = r.bottom - s.top;
+			}
+		}
+
+		bar.setCssProps({ "--pp-bottom-offset": `${offset}px` });
+		this.setStatusBarUnder(hiddenOnTop);
+	}
+
+	/** Only write the body class on a real change; the body-class observer sees every write. */
+	private setStatusBarUnder(on: boolean) {
+		if (document.body.hasClass("pp-status-bar-under") !== on) document.body.toggleClass("pp-status-bar-under", on);
+	}
+
+	hide() {
+		this.bar?.remove();
+		this.bar = null;
+		this.setStatusBarUnder(false);
+	}
 
 	private mkSkip(parent: HTMLElement, label: string, title: string, delta: number) {
 		const btn = parent.createDiv("clickable-icon pp-np-skip");
@@ -265,6 +365,60 @@ class NowPlayingBar {
 	destroy() { this.hide(); }
 }
 
+// -- Embed Mirror ------------------------------------------------------------
+// Inline embeds stay paused while the pooled element plays. Keep their
+// scrubbers on the playback position, and let dragging one seek playback.
+
+class EmbedMirror {
+	/** Embed -> the time we last set on it, to tell our seeks from the user's. */
+	private synced = new WeakMap<HTMLAudioElement, number>();
+
+	constructor(private ctrl: Controller, private app: App, plugin: Plugin) {
+		ctrl.on("timeupdate", () => this.syncAll());
+
+		// A freshly rendered embed (note reopened, scrolled back into view)
+		// starts at 0: move it to where its audio was left.
+		plugin.registerDomEvent(document, "loadedmetadata", (e: Event) => {
+			const t = embedAudio(e.target);
+			if (!t) return;
+			const pos = this.ctrl.positionOf(t.src, noteOf(this.app, t));
+			if (pos) this.set(t, pos);
+		}, true);
+
+		plugin.registerDomEvent(document, "seeking", (e: Event) => {
+			const t = embedAudio(e.target);
+			if (!t || t.src !== this.ctrl.active?.src || noteOf(this.app, t) !== this.ctrl.notePath) return;
+			const ours = this.synced.get(t);
+			if (ours !== undefined && Math.abs(t.currentTime - ours) < 0.05) return;
+			this.ctrl.seek(t.currentTime);
+		}, true);
+	}
+
+	private syncAll() {
+		const el = this.ctrl.active;
+		if (!el) return;
+		// Half a second of slack keeps this from seeking the embed on every tick.
+		for (const t of this.embedsIn(this.ctrl.notePath)) {
+			if (t.src === el.src && Math.abs(t.currentTime - el.currentTime) > 0.5) this.set(t, el.currentTime);
+		}
+	}
+
+	private set(t: HTMLAudioElement, time: number) {
+		this.synced.set(t, time);
+		t.currentTime = time;
+	}
+
+	private embedsIn(note: string): HTMLAudioElement[] {
+		const out: HTMLAudioElement[] = [];
+		for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+			if (leaf.view instanceof MarkdownView && leaf.view.file?.path === note) {
+				out.push(...Array.from(leaf.view.containerEl.querySelectorAll("audio")));
+			}
+		}
+		return out;
+	}
+}
+
 // -- Plugin ------------------------------------------------------------------
 
 export default class PersistentPlayerPlugin extends Plugin {
@@ -275,34 +429,27 @@ export default class PersistentPlayerPlugin extends Plugin {
 		this.ctrl = new Controller();
 		this.bar = new NowPlayingBar(this.ctrl, this.app, this);
 
+		new EmbedMirror(this.ctrl, this.app, this);
+
 		this.registerDomEvent(document, "play", (e: Event) => {
-			const t = e.target;
-			// Only hijack audio embeds. Video keeps its native inline player:
-			// the now-playing bar has no video surface, so pooling a video
-			// would silently drop the picture.
-			if (!(t instanceof HTMLAudioElement)) return;
-			if (t.hasClass("pp-pooled")) return;
-			if (!t.closest(".workspace")) return;
-			const src = t.src;
-			if (!src) return;
+			const t = embedAudio(e.target);
+			if (!t) return;
 
-			// Neutralise the inline embed so only the pooled element plays.
-			t.removeAttribute("src");
-			t.load();
+			// Pause the inline embed so only the pooled element plays. Don't clear
+			// its src: an embed without one greys out and can't be played again.
+			t.pause();
 
-			const note = this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path ?? "";
-			this.ctrl.loadAndPlay(src, note);
+			this.ctrl.loadAndPlay(t.src, noteOf(this.app, t), t.currentTime);
 		}, true);
 
-		this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
-			const note = this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path ?? "";
-			if (!note || note === this.ctrl.notePath) return;
-
-			if (this.ctrl.switchTo(note)) {
-				this.bar.show();
-			} else {
-				this.bar.hide();
-			}
+		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+			this.ctrl.renameNote(oldPath, file.path);
+			this.bar.attach();
+		}));
+		this.registerEvent(this.app.vault.on("delete", (file) => {
+			const playing = file.path === this.ctrl.notePath;
+			this.ctrl.clearNote(file.path);
+			if (playing) this.bar.hide();
 		}));
 
 		this.addCommand({
@@ -358,12 +505,23 @@ export default class PersistentPlayerPlugin extends Plugin {
 	}
 }
 
-/** Height of the area hidden by the notch / status bar, in CSS pixels. */
-function safeAreaTop(): number {
-	const probe = document.body.createDiv("pp-safe-area-probe");
-	const h = probe.getBoundingClientRect().height;
-	probe.remove();
-	return h;
+/**
+ * The target if it's an audio embed in a note, not one of our pooled elements.
+ * Video keeps its native inline player: the now-playing bar has no video
+ * surface, so pooling a video would silently drop the picture.
+ */
+function embedAudio(target: EventTarget | null): HTMLAudioElement | null {
+	if (!(target instanceof HTMLAudioElement)) return null;
+	if (target.hasClass("pp-pooled") || !target.closest(".workspace") || !target.src) return null;
+	return target;
+}
+
+/** Path of the note whose view contains el, or "" (e.g. a hover preview). */
+function noteOf(app: App, el: HTMLElement): string {
+	for (const leaf of app.workspace.getLeavesOfType("markdown")) {
+		if (leaf.view instanceof MarkdownView && leaf.view.containerEl.contains(el)) return leaf.view.file?.path ?? "";
+	}
+	return "";
 }
 
 function fmt(sec: number): string {

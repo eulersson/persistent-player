@@ -14,9 +14,9 @@
 	gap: 6px;
 	box-sizing: content-box;
 	height: 32px;
-	padding: var(--pp-top-offset, 0px) 8px 0;
+	padding: 0 8px var(--pp-bottom-offset, 0px);
 	background-color: var(--background-secondary);
-	border-bottom: 1px solid var(--background-modifier-border);
+	border-top: 1px solid var(--background-modifier-border);
 	font-size: var(--font-ui-smaller);
 	color: var(--text-normal);
 	flex-shrink: 0;
@@ -37,6 +37,23 @@
 }
 
 .pp-np-skip:hover { color: var(--text-normal); }
+
+.pp-np-source {
+	min-width: 0;
+	max-width: 30%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--text-muted);
+	cursor: pointer;
+	padding: 2px 4px;
+	border-radius: var(--radius-s);
+}
+
+.pp-np-source:hover {
+	color: var(--text-normal);
+	background-color: var(--background-modifier-hover);
+}
 
 .pp-np-center {
 	flex: 1;
@@ -95,23 +112,21 @@
 
 .pp-now-playing:hover .pp-np-close { opacity: 1; }
 
-.pp-safe-area-probe {
-	position: fixed;
-	top: 0;
-	left: 0;
-	width: 0;
-	height: env(safe-area-inset-top, 0px);
-	visibility: hidden;
-	pointer-events: none;
-}
+/* The status bar is faded out over the bar (Minimal's focus mode) but still on
+   top: let clicks through to the bar's controls instead. */
+body.pp-status-bar-under .status-bar { pointer-events: none; }
 
 /* -- Mobile --------------------------------------------------------------- */
 
 .is-mobile .pp-now-playing {
 	height: 44px;
 	gap: 4px;
+	/* Phones with the floating navbar let it and the home indicator cover the
+	   bottom of the view; Obsidian sizes that area here (0 otherwise). */
+	--pp-bottom-offset: var(--view-bottom-spacing, 0px);
 }
 
+.is-mobile .pp-np-source { max-width: 25%; }
 .is-mobile .pp-np-center { padding: 12px 0; }
 .is-mobile .pp-np-track { height: 4px; }
 .is-mobile .pp-np-play svg,
